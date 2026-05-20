@@ -1,7 +1,7 @@
 """
 Hermes Voice Gateway — 通用语音交互中间件
 
-架构：麦克风 → SileroVAD → Whisper(STT) → LLMContext聚合 → OpenAI兼容LLM → Kokoro(TTS) → 扬声器
+架构：麦克风 → SileroVAD → Whisper(STT) → LLMContext聚合 → OpenAI兼容LLM → Edge(TTS) → 扬声器
 用途：让任何暴露 OpenAI 兼容 API 的 Agent 获得实时语音交互能力
 
 用法：
@@ -25,7 +25,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.runner.run import main
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transcriptions.language import Language
@@ -40,8 +39,8 @@ HERMES_API_URL = os.getenv("HERMES_API_URL", "http://127.0.0.1:8642/v1")
 # STT: faster-whisper 本地，免费
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 
-# TTS: Kokoro ONNX 本地，免费
-KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
+# TTS: Edge TTS (Microsoft, 免费, 支持中文)
+EDGE_VOICE = os.getenv("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
 
 
 transport_params = {
@@ -73,13 +72,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ),
     )
 
-    # TTS: 文字 → 语音（本地 Kokoro ONNX）
-    tts = KokoroTTSService(
-        settings=KokoroTTSService.Settings(
-            voice=KOKORO_VOICE,
-            language=Language.ZH,
-        ),
-    )
+    # TTS: 文字 → 语音（Edge TTS，免费，支持中文）
+    from edge_tts_service import EdgeTTSService
+    tts = EdgeTTSService(voice=EDGE_VOICE)
 
     # LLM 上下文 + 聚合器（VAD 检测用户说完 → 聚合成完整消息 → 触发 LLM）
     context = LLMContext()
@@ -115,7 +110,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         logger.info("Client connected")
         # 启动对话
         context.add_message(
-            {"role": "developer", "content": "请用中文简短介绍自己，告诉用户你可以语音对话。"}
+            {"role": "user", "content": "请用中文简短介绍自己，告诉用户你可以语音对话。"}
         )
         await task.queue_frames([LLMRunFrame()])
 
