@@ -1,7 +1,7 @@
 """
 Hermes Voice Gateway — 通用语音交互中间件
 
-架构：麦克风 → faster-whisper(STT) → OpenAI兼容LLM → Kokoro(TTS) → 扬声器
+架构：麦克风 → SileroVAD → Whisper(STT) → LLMContext聚合 → OpenAI兼容LLM → Kokoro(TTS) → 扬声器
 用途：让任何暴露 OpenAI 兼容 API 的 Agent 获得实时语音交互能力
 
 用法：
@@ -10,17 +10,26 @@ Hermes Voice Gateway — 通用语音交互中间件
 """
 
 import os
-from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.whisper.stt import WhisperSTTService
-from pipecat.services.kokoro.tts import KokoroTTSService
-from pipecat.transcriptions.language import Language
-from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from loguru import logger
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.runner.run import main
-from pipecat.runner.types import SmallWebRTCRunnerArguments
-from pipecat.transports.base_transport import TransportParams
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+from pipecat.services.kokoro.tts import KokoroTTSService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.whisper.stt import WhisperSTTService
+from pipecat.transcriptions.language import Language
+from pipecat.transports.base_transport import BaseTransport, TransportParams
 
 
 # ===== 配置区（环境变量 > 默认值）=====
@@ -29,16 +38,23 @@ HERMES_API_KEY = os.getenv("HERMES_API_KEY", "change-me-local-dev")
 HERMES_API_URL = os.getenv("HERMES_API_URL", "http://127.0.0.1:8642/v1")
 
 # STT: faster-whisper 本地，免费
-# 模型选择：tiny(最快) / base(快+准) / medium(准+慢) / large(最准)
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 
 # TTS: Kokoro ONNX 本地，免费
-# 语音：af_heart, af_bella, af_nicole, am_adam, bf_emma 等
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 
 
-async def run_bot(transport):
+transport_params = {
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
+}
+
+
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     """Transport 无关的 pipeline 逻辑"""
+
     # STT: 语音 → 文字（本地 faster-whisper）
     stt = WhisperSTTService(
         settings=WhisperSTTService.Settings(
@@ -48,11 +64,13 @@ async def run_bot(transport):
     )
 
     # LLM: 连接任意 OpenAI 兼容接口
-    # 核心：改 base_url 就能对接不同的 Agent / 大模型
     llm = OpenAILLMService(
         api_key=HERMES_API_KEY,
         base_url=HERMES_API_URL,
-        model="hermes-agent",
+        settings=OpenAILLMService.Settings(
+            model="hermes-agent",
+            system_instruction="你叫墨凌（小凌），是一个AI助手。你在进行语音对话，请用简短自然的口语回答，不要用emoji、列表或其他无法朗读的格式。",
+        ),
     )
 
     # TTS: 文字 → 语音（本地 Kokoro ONNX）
@@ -63,32 +81,57 @@ async def run_bot(transport):
         ),
     )
 
+    # LLM 上下文 + 聚合器（VAD 检测用户说完 → 聚合成完整消息 → 触发 LLM）
+    context = LLMContext()
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
+
     # 组装 Pipeline
     pipeline = Pipeline([
-        transport.input(),   # 麦克风音频输入
-        stt,                 # 语音 → 文字
-        llm,                 # 文字 → Agent → 回复文字
-        tts,                 # 回复文字 → 语音
-        transport.output(),  # 语音播放输出
+        transport.input(),       # 麦克风音频输入
+        stt,                     # 语音 → 文字
+        user_aggregator,         # 聚合用户消息（等VAD检测说完）
+        llm,                     # 文字 → Agent → 回复文字
+        tts,                     # 回复文字 → 语音
+        transport.output(),      # 语音播放输出
+        assistant_aggregator,    # 聚合助手回复
     ])
 
     task = PipelineTask(
         pipeline,
-        params=PipelineParams(allow_interruptions=True),
-    )
-    await PipelineRunner().run(task)
-
-
-async def bot(runner_args: SmallWebRTCRunnerArguments):
-    """Pipecat Runner 入口 — SmallWebRTC 模式"""
-    transport = SmallWebRTCTransport(
-        params=TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
+        params=PipelineParams(
+            allow_interruptions=True,
+            enable_metrics=True,
         ),
-        webrtc_connection=runner_args.webrtc_connection,
+        idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
-    await run_bot(transport)
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected")
+        # 启动对话
+        context.add_message(
+            {"role": "developer", "content": "请用中文简短介绍自己，告诉用户你可以语音对话。"}
+        )
+        await task.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected")
+        await task.cancel()
+
+    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+    await runner.run(task)
+
+
+async def bot(runner_args: RunnerArguments):
+    """Pipecat Runner 入口"""
+    transport = await create_transport(runner_args, transport_params)
+    await run_bot(transport, runner_args)
 
 
 if __name__ == "__main__":
