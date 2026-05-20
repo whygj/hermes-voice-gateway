@@ -1,7 +1,7 @@
 """
 Hermes Voice Gateway — 通用语音交互中间件
 
-架构：麦克风 → SileroVAD → GLM-ASR(STT) → LLMContext聚合 → OpenAI兼容LLM → Edge(TTS) → 扬声器
+架构：麦克风 → SileroVAD → Groq Whisper(STT) → LLMContext聚合 → OpenAI兼容LLM → Edge(TTS) → 扬声器
 用途：让任何暴露 OpenAI 兼容 API 的 Agent 获得实时语音交互能力
 
 用法：
@@ -34,8 +34,8 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 HERMES_API_KEY = os.getenv("HERMES_API_KEY", "change-me-local-dev")
 HERMES_API_URL = os.getenv("HERMES_API_URL", "http://127.0.0.1:8642/v1")
 
-# STT: 智谱 GLM-ASR-2512 云端识别
-GLM_API_KEY = os.getenv("GLM_API_KEY", "")
+# STT: Groq Whisper（免费额度大，LPU硬件极快）
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # TTS: Edge TTS (Microsoft, 免费, 支持中文)
 EDGE_VOICE = os.getenv("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
@@ -52,9 +52,13 @@ transport_params = {
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     """Transport 无关的 pipeline 逻辑"""
 
-    # STT: 语音 → 文字（智谱 GLM-ASR-2512 云端）
-    from glm_asr_service import GLMASRService
-    stt = GLMASRService(api_key=GLM_API_KEY)
+    # STT: 语音 → 文字（Groq Whisper，云端极速）
+    from pipecat.services.groq.stt import GroqSTTService
+    from pipecat.transcriptions.language import Language
+    stt = GroqSTTService(
+        api_key=GROQ_API_KEY,
+        language=Language.ZH,
+    )
 
     # LLM: 连接任意 OpenAI 兼容接口
     llm = OpenAILLMService(
